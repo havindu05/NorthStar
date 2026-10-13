@@ -1,14 +1,12 @@
 import { createServer } from "node:http";
 import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
-import { dirname, extname, join, resolve } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { dirname, extname, join } from "node:path";
 import { promisify } from "node:util";
-import { DatabaseSync } from "node:sqlite";
+import { closeDatabase, dbAll, dbGet, dbRun, initializeDatabase, usesPostgres, withTransaction } from "./database.mjs";
 
 const scrypt = promisify(scryptCallback);
 const root = dirname(new URL(import.meta.url).pathname);
-const dataDirectory = resolve(process.env.DATA_DIRECTORY || join(root, "data"));
-const databasePath = resolve(process.env.DATABASE_PATH || join(dataDirectory, "auth.sqlite"));
 const port = Number(process.env.PORT || 3000);
 const maxRequestBytes = 12_000;
 const secureCookie = process.env.NODE_ENV === "production";
@@ -37,87 +35,7 @@ try {
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("PORT must be a valid TCP port.");
 process.umask(0o077);
-mkdirSync(dirname(databasePath), { recursive: true });
-const database = new DatabaseSync(databasePath);
-chmodSync(databasePath, 0o600);
-database.exec(`
-  PRAGMA foreign_keys = ON;
-  PRAGMA journal_mode = WAL;
-  PRAGMA synchronous = NORMAL;
-  PRAGMA busy_timeout = 5000;
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    plan TEXT NOT NULL DEFAULT 'free',
-    subscription_status TEXT NOT NULL DEFAULT 'inactive',
-    stripe_customer_id TEXT UNIQUE,
-    stripe_subscription_id TEXT UNIQUE,
-    paddle_customer_id TEXT UNIQUE,
-    paddle_subscription_id TEXT UNIQUE,
-    subscription_period_end INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
-  CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    due_date TEXT,
-    priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high')),
-    completed_at INTEGER,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS tasks_user_due_idx ON tasks(user_id, due_date, completed_at);
-  CREATE TABLE IF NOT EXISTS activities (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('class', 'club', 'sport', 'study', 'break', 'other')),
-    starts_at INTEGER NOT NULL,
-    ends_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS activities_user_time_idx ON activities(user_id, starts_at);
-  CREATE TABLE IF NOT EXISTS stripe_events (
-    event_id TEXT PRIMARY KEY,
-    processed_at INTEGER NOT NULL
-  );
-`);
-
-function ensureColumn(table, column, definition) {
-  const columns = database.prepare(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((entry) => entry.name === column)) {
-    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
-ensureColumn("users", "plan", "TEXT NOT NULL DEFAULT 'free'");
-ensureColumn("users", "subscription_status", "TEXT NOT NULL DEFAULT 'inactive'");
-ensureColumn("users", "stripe_customer_id", "TEXT");
-ensureColumn("users", "stripe_subscription_id", "TEXT");
-ensureColumn("users", "paddle_customer_id", "TEXT");
-ensureColumn("users", "paddle_subscription_id", "TEXT");
-ensureColumn("users", "subscription_period_end", "INTEGER");
-ensureColumn("users", "paddle_subscription_updated_at", "INTEGER");
-ensureColumn("sessions", "created_at", "INTEGER NOT NULL DEFAULT 0");
-database.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_customer_idx ON users(stripe_customer_id);
-  CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_subscription_idx ON users(stripe_subscription_id);
-  CREATE UNIQUE INDEX IF NOT EXISTS users_paddle_customer_idx ON users(paddle_customer_id);
-  CREATE UNIQUE INDEX IF NOT EXISTS users_paddle_subscription_idx ON users(paddle_subscription_id);
-  CREATE TABLE IF NOT EXISTS paddle_events (
-    event_id TEXT PRIMARY KEY,
-    processed_at INTEGER NOT NULL
-  );
-`);
+await initializeDatabase();
 
 const dummySalt = Buffer.from("8d06f7461c4fce86b25893f6d1593e29", "hex");
 const dummyHash = await scrypt("not-a-real-password", dummySalt, passwordHashBytes);
@@ -284,20 +202,20 @@ function getCookie(request, name) {
   return "";
 }
 
-function getUserFromSession(request) {
+async function getUserFromSession(request) {
   const token = getCookie(request, "northstar_session");
   if (!/^[a-f0-9]{64}$/.test(token)) return null;
   const now = Date.now();
-  database.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now);
-  return database.prepare(`
+  await dbRun("DELETE FROM sessions WHERE expires_at <= ?", [now]);
+  return await dbGet(`
     SELECT id, name, email, plan, subscription_status, subscription_period_end, stripe_customer_id, paddle_customer_id
     FROM users
     WHERE id = (SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?)
-  `).get(hashToken(token), now) || null;
+  `, [hashToken(token), now]) || null;
 }
 
-function requireUser(request, response) {
-  const user = getUserFromSession(request);
+async function requireUser(request, response) {
+  const user = await getUserFromSession(request);
   if (!user) {
     json(response, 401, { error: "Please sign in to continue." });
     return null;
@@ -309,8 +227,8 @@ function isAdmin(user) {
   return Boolean(user && adminEmails.has(user.email.toLowerCase()));
 }
 
-function requireAdmin(request, response) {
-  const user = getUserFromSession(request);
+async function requireAdmin(request, response) {
+  const user = await getUserFromSession(request);
   if (!user) {
     json(response, 401, { error: "Please sign in to continue." });
     return null;
@@ -322,16 +240,16 @@ function requireAdmin(request, response) {
   return user;
 }
 
-function createSession(userId, response, remember = false) {
+async function createSession(userId, response, remember = false) {
   const token = randomBytes(32).toString("hex");
   const now = Date.now();
   const lifetime = remember ? 30 * 24 * 60 * 60 * 1000 : 12 * 60 * 60 * 1000;
-  database.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)").run(
+  await dbRun("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", [
     hashToken(token),
     userId,
     now + lifetime,
     now,
-  );
+  ]);
   response.setHeader("Set-Cookie", cookieHeader(token, remember ? lifetime / 1000 : undefined));
 }
 
@@ -369,16 +287,16 @@ async function signup(request, response) {
   const salt = randomBytes(passwordSaltBytes);
   const passwordHash = await scrypt(input.password, salt, passwordHashBytes);
   try {
-    const result = database.prepare("INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)").run(
+    const result = await dbRun("INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?) RETURNING id", [
       name,
       email,
       `scrypt$${salt.toString("hex")}$${passwordHash.toString("hex")}`,
       Date.now(),
-    );
-    createSession(Number(result.lastInsertRowid), response);
+    ]);
+    await createSession(Number(result.lastInsertRowid), response);
     json(response, 201, { message: "Your account is ready. Welcome to Northstar!", user: { name, email, plan: "free" } });
   } catch (error) {
-    if (error.code === "ERR_SQLITE_CONSTRAINT_UNIQUE") {
+    if (error.code === "ERR_SQLITE_CONSTRAINT_UNIQUE" || error.code === "23505") {
       json(response, 409, { error: "An account with that email already exists.", fieldErrors: { email: "This email is already registered." } });
       return;
     }
@@ -395,7 +313,7 @@ async function login(request, response) {
     return;
   }
   const email = input.email.trim().toLowerCase();
-  const user = database.prepare("SELECT id, name, email, password_hash, plan FROM users WHERE email = ?").get(email);
+  const user = await dbGet("SELECT id, name, email, password_hash, plan FROM users WHERE lower(email) = lower(?)", [email]);
   const [scheme, saltHex, hashHex] = user?.password_hash.split("$") || [];
   const salt = scheme === "scrypt" && /^[a-f0-9]{32}$/.test(saltHex) ? Buffer.from(saltHex, "hex") : dummySalt;
   const expected = scheme === "scrypt" && /^[a-f0-9]{128}$/.test(hashHex) ? Buffer.from(hashHex, "hex") : dummyHash;
@@ -404,7 +322,7 @@ async function login(request, response) {
     json(response, 401, { error: "We couldn’t sign you in with those details. Check your email and password and try again." });
     return;
   }
-  createSession(user.id, response, input.remember === true);
+  await createSession(user.id, response, input.remember === true);
   json(response, 200, { message: "You’re signed in. Welcome back!", user: { name: user.name, email: user.email, plan: user.plan } });
 }
 
@@ -449,15 +367,15 @@ function apiTask(row) {
     dueDate: row.due_date,
     priority: row.priority,
     completed: row.completed_at !== null,
-    createdAt: row.created_at,
+    createdAt: Number(row.created_at),
   };
 }
 
 function apiActivity(row) {
-  return { id: row.id, title: row.title, kind: row.kind, startsAt: row.starts_at, endsAt: row.ends_at };
+  return { id: row.id, title: row.title, kind: row.kind, startsAt: Number(row.starts_at), endsAt: Number(row.ends_at) };
 }
 
-function studentData(user, taskFilter, taskOffset) {
+async function studentData(user, taskFilter, taskOffset) {
   const now = Date.now();
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
@@ -468,25 +386,25 @@ function studentData(user, taskFilter, taskOffset) {
   const localDate = `${startOfToday.getFullYear()}-${String(startOfToday.getMonth() + 1).padStart(2, "0")}-${String(startOfToday.getDate()).padStart(2, "0")}`;
   const taskState = taskFilter === "completed" ? "completed_at IS NOT NULL" : "completed_at IS NULL";
   const taskOrder = taskFilter === "completed" ? "completed_at DESC" : "due_date IS NULL, due_date, created_at DESC";
-  const tasks = database.prepare(`SELECT * FROM tasks WHERE user_id = ? AND ${taskState} ORDER BY ${taskOrder} LIMIT 51 OFFSET ?`).all(user.id, taskOffset);
-  const activities = database.prepare("SELECT * FROM activities WHERE user_id = ? AND starts_at >= ? AND starts_at < ? ORDER BY starts_at LIMIT 100").all(user.id, start, end);
-  const activeCount = database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL").get(user.id).count;
-  const completedCount = database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NOT NULL").get(user.id).count;
-  const activitiesThisMonth = database.prepare(`
+  const tasks = await dbAll(`SELECT * FROM tasks WHERE user_id = ? AND ${taskState} ORDER BY ${taskOrder} LIMIT 51 OFFSET ?`, [user.id, taskOffset]);
+  const activities = await dbAll("SELECT * FROM activities WHERE user_id = ? AND starts_at >= ? AND starts_at < ? ORDER BY starts_at LIMIT 100", [user.id, start, end]);
+  const activeCount = Number((await dbGet("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL", [user.id])).count);
+  const completedCount = Number((await dbGet("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NOT NULL", [user.id])).count);
+  const activitiesThisMonth = Number((await dbGet(`
     SELECT COUNT(*) AS count FROM activities
     WHERE user_id = ? AND kind IN ('club', 'sport', 'other') AND starts_at >= ? AND starts_at < ?
-  `).get(user.id, monthStart, monthEnd).count;
+  `, [user.id, monthStart, monthEnd])).count);
   return {
-    user: { id: user.id, name: user.name, email: user.email, plan: user.plan, subscriptionStatus: user.subscription_status, periodEnd: user.subscription_period_end, hasPaymentProfile: Boolean(user.stripe_customer_id || user.paddle_customer_id), isAdmin: isAdmin(user) },
+    user: { id: user.id, name: user.name, email: user.email, plan: user.plan, subscriptionStatus: user.subscription_status, periodEnd: user.subscription_period_end === null ? null : Number(user.subscription_period_end), hasPaymentProfile: Boolean(user.stripe_customer_id || user.paddle_customer_id), isAdmin: isAdmin(user) },
     tasks: tasks.slice(0, 50).map(apiTask),
     taskCounts: { active: activeCount, completed: completedCount },
     taskHasMore: tasks.length > 50,
     activities: activities.map(apiActivity),
     usage: { activeTasks: activeCount, taskLimit: user.plan === "plus" ? null : freeTaskLimit, monthlyActivities: activitiesThisMonth, activityLimit: user.plan === "plus" ? null : freeActivityLimit },
     summary: {
-      completedThisWeek: database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at >= ?").get(user.id, start).count,
-      dueToday: database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL AND due_date = ?").get(user.id, localDate).count,
-      upcomingThisWeek: activities.filter((activity) => activity.starts_at >= now).length,
+      completedThisWeek: Number((await dbGet("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at >= ?", [user.id, start])).count),
+      dueToday: Number((await dbGet("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL AND due_date = ?", [user.id, localDate])).count),
+      upcomingThisWeek: activities.filter((activity) => Number(activity.starts_at) >= now).length,
     },
   };
 }
@@ -778,23 +696,23 @@ async function listStripeRecurringRevenue() {
 }
 
 async function ownerDashboard(admin, response) {
-  const userCounts = database.prepare(`
-    SELECT COUNT(*) AS total,
-      SUM(CASE WHEN plan = 'free' THEN 1 ELSE 0 END) AS free,
-      SUM(CASE WHEN plan = 'plus' THEN 1 ELSE 0 END) AS plus,
-      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS newThisMonth
+  const userCounts = await dbGet(`
+    SELECT CAST(COUNT(*) AS INTEGER) AS total,
+      CAST(SUM(CASE WHEN plan = 'free' THEN 1 ELSE 0 END) AS INTEGER) AS free,
+      CAST(SUM(CASE WHEN plan = 'plus' THEN 1 ELSE 0 END) AS INTEGER) AS plus,
+      CAST(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS INTEGER) AS "newThisMonth"
     FROM users
-  `).get(new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime());
-  const contentCounts = database.prepare(`
+  `, [new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime()]);
+  const contentCounts = await dbGet(`
     SELECT
-      (SELECT COUNT(*) FROM tasks) AS tasks,
-      (SELECT COUNT(*) FROM activities) AS activities,
-      (SELECT COUNT(*) FROM sessions WHERE expires_at > ?) AS liveSessions
-  `).get(Date.now());
-  const recentUsers = database.prepare(`
+      (SELECT CAST(COUNT(*) AS INTEGER) FROM tasks) AS tasks,
+      (SELECT CAST(COUNT(*) AS INTEGER) FROM activities) AS activities,
+      (SELECT CAST(COUNT(*) AS INTEGER) FROM sessions WHERE expires_at > ?) AS "liveSessions"
+  `, [Date.now()]);
+  const recentUsers = await dbAll(`
     SELECT id, name, email, plan, subscription_status, created_at
     FROM users ORDER BY created_at DESC LIMIT 10
-  `).all();
+  `);
   const stripe = businessCountry === "LK"
     ? {
       configured: paddleReadyForBilling(),
@@ -807,14 +725,14 @@ async function ownerDashboard(admin, response) {
   json(response, 200, {
     admin: { name: admin.name, email: admin.email },
     users: {
-      total: userCounts.total || 0,
-      free: userCounts.free || 0,
-      plus: userCounts.plus || 0,
-      newThisMonth: userCounts.newThisMonth || 0,
+      total: Number(userCounts.total || 0),
+      free: Number(userCounts.free || 0),
+      plus: Number(userCounts.plus || 0),
+      newThisMonth: Number(userCounts.newThisMonth || 0),
     },
-    product: { tasks: contentCounts.tasks, activities: contentCounts.activities, liveSessions: contentCounts.liveSessions },
+    product: { tasks: Number(contentCounts.tasks), activities: Number(contentCounts.activities), liveSessions: Number(contentCounts.liveSessions) },
     billing: stripe,
-    recentUsers,
+    recentUsers: recentUsers.map((user) => ({ ...user, created_at: Number(user.created_at) })),
     generatedAt: Date.now(),
   });
 }
@@ -911,22 +829,22 @@ function paddleUserId(customData) {
   return Number.isSafeInteger(userId) && userId > 0 ? userId : null;
 }
 
-function handlePaddleEvent(event) {
+async function handlePaddleEvent(event, client) {
   const data = event.data;
   const occurredAt = Date.parse(event.occurred_at);
   if (event.event_type === "transaction.completed") {
     const userId = paddleUserId(data.custom_data);
     if (!userId || !/^ctm_[a-z\d]{26}$/.test(data.customer_id || "")) return;
-    database.prepare(`
+    await dbRun(`
       UPDATE users
       SET paddle_customer_id = ?,
           paddle_subscription_id = COALESCE(?, paddle_subscription_id)
       WHERE id = ?
-    `).run(
+    `, [
       data.customer_id,
       /^sub_[a-z\d]{26}$/.test(data.subscription_id || "") ? data.subscription_id : null,
       userId,
-    );
+    ], client);
     return;
   }
 
@@ -934,7 +852,7 @@ function handlePaddleEvent(event) {
   const userId = paddleUserId(data.custom_data);
   const customerId = /^ctm_[a-z\d]{26}$/.test(data.customer_id || "") ? data.customer_id : null;
   const existing = customerId
-    ? database.prepare("SELECT id FROM users WHERE paddle_customer_id = ?").get(customerId)
+    ? await dbGet("SELECT id FROM users WHERE paddle_customer_id = ?", [customerId], client)
     : null;
   const ownerId = existing?.id || userId;
   if (!ownerId) return;
@@ -943,7 +861,7 @@ function handlePaddleEvent(event) {
   const grantsAccess = status === "active" || status === "trialing";
   const subscriptionId = /^sub_[a-z\d]{26}$/.test(data.id || "") ? data.id : null;
   const periodEnd = data.current_billing_period?.ends_at ? Date.parse(data.current_billing_period.ends_at) : null;
-  database.prepare(`
+  await dbRun(`
     UPDATE users
     SET paddle_customer_id = COALESCE(?, paddle_customer_id),
         paddle_subscription_id = ?,
@@ -952,7 +870,7 @@ function handlePaddleEvent(event) {
         plan = ?,
         paddle_subscription_updated_at = ?
     WHERE id = ? AND COALESCE(paddle_subscription_updated_at, 0) <= ?
-  `).run(
+  `, [
     customerId,
     status === "canceled" ? null : subscriptionId,
     status,
@@ -961,7 +879,7 @@ function handlePaddleEvent(event) {
     occurredAt,
     ownerId,
     occurredAt,
-  );
+  ], client);
 }
 
 async function paddleWebhook(request, response) {
@@ -987,47 +905,41 @@ async function paddleWebhook(request, response) {
     json(response, 400, { error: "Invalid Paddle webhook event." });
     return;
   }
-  if (database.prepare("SELECT 1 FROM paddle_events WHERE event_id = ?").get(event.event_id)) {
-    json(response, 200, { received: true });
-    return;
-  }
-  database.exec("BEGIN IMMEDIATE");
-  try {
-    handlePaddleEvent(event);
-    database.prepare("INSERT INTO paddle_events (event_id, processed_at) VALUES (?, ?)").run(event.event_id, Date.now());
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+  await withTransaction(async (client) => {
+    const inserted = await dbRun("INSERT INTO paddle_events (event_id, processed_at) VALUES (?, ?) ON CONFLICT(event_id) DO NOTHING", [
+      event.event_id, Date.now(),
+    ], client);
+    if (!inserted.changes) return;
+    await handlePaddleEvent(event, client);
+  });
   json(response, 200, { received: true });
 }
 
-function handleStripeEvent(event) {
+async function handleStripeEvent(event, client) {
   const object = event.data.object;
   const eventType = event.type;
   let customerId = typeof object.customer === "string" ? object.customer : object.customer?.id;
   if (eventType === "checkout.session.completed") {
     const userId = Number(object.client_reference_id || object.metadata?.userId);
     if (!Number.isSafeInteger(userId) || userId < 1 || !customerId) return;
-    database.prepare("UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, subscription_status = ? WHERE id = ?").run(
+    await dbRun("UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ?, subscription_status = ? WHERE id = ?", [
       customerId,
       typeof object.subscription === "string" ? object.subscription : null,
       "incomplete",
       userId,
-    );
+    ], client);
     return;
   }
   if (eventType.startsWith("customer.subscription.")) {
     const metadataUserId = Number(object.metadata?.userId);
     const existing = customerId
-      ? database.prepare("SELECT id FROM users WHERE stripe_customer_id = ?").get(customerId)
+      ? await dbGet("SELECT id FROM users WHERE stripe_customer_id = ?", [customerId], client)
       : null;
     const userId = existing?.id || (Number.isSafeInteger(metadataUserId) ? metadataUserId : null);
     if (!userId) return;
     const status = eventType === "customer.subscription.deleted" ? "canceled" : String(object.status || "inactive");
     const hasAccess = status === "active" || status === "trialing";
-    database.prepare(`
+    await dbRun(`
       UPDATE users
       SET stripe_customer_id = COALESCE(?, stripe_customer_id),
           stripe_subscription_id = ?,
@@ -1035,18 +947,18 @@ function handleStripeEvent(event) {
           subscription_period_end = ?,
           plan = ?
       WHERE id = ?
-    `).run(
+    `, [
       customerId || null,
       eventType === "customer.subscription.deleted" ? null : object.id,
       status,
       Number.isSafeInteger(object.current_period_end) ? object.current_period_end * 1000 : null,
       hasAccess ? "plus" : "free",
       userId,
-    );
+    ], client);
     return;
   }
   if (eventType === "invoice.payment_failed" && customerId) {
-    database.prepare("UPDATE users SET subscription_status = 'past_due', plan = 'free' WHERE stripe_customer_id = ?").run(customerId);
+    await dbRun("UPDATE users SET subscription_status = 'past_due', plan = 'free' WHERE stripe_customer_id = ?", [customerId], client);
   }
 }
 
@@ -1067,19 +979,13 @@ async function stripeWebhook(request, response) {
     json(response, 400, { error: "Invalid webhook event." });
     return;
   }
-  if (database.prepare("SELECT 1 FROM stripe_events WHERE event_id = ?").get(event.id)) {
-    json(response, 200, { received: true });
-    return;
-  }
-  database.exec("BEGIN IMMEDIATE");
-  try {
-    handleStripeEvent(event);
-    database.prepare("INSERT INTO stripe_events (event_id, processed_at) VALUES (?, ?)").run(event.id, Date.now());
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
+  await withTransaction(async (client) => {
+    const inserted = await dbRun("INSERT INTO stripe_events (event_id, processed_at) VALUES (?, ?) ON CONFLICT(event_id) DO NOTHING", [
+      event.id, Date.now(),
+    ], client);
+    if (!inserted.changes) return;
+    await handleStripeEvent(event, client);
+  });
   json(response, 200, { received: true });
 }
 
@@ -1102,7 +1008,7 @@ async function handleApi(request, response, pathname) {
     return;
   }
   if (request.method === "GET" && pathname === "/api/session") {
-    const user = getUserFromSession(request);
+    const user = await getUserFromSession(request);
     json(response, 200, { user: user ? { name: user.name, email: user.email, plan: user.plan, isAdmin: isAdmin(user) } : null });
     return;
   }
@@ -1120,17 +1026,17 @@ async function handleApi(request, response, pathname) {
   }
   if (request.method === "POST" && pathname === "/api/logout") {
     const token = getCookie(request, "northstar_session");
-    if (/^[a-f0-9]{64}$/.test(token)) database.prepare("DELETE FROM sessions WHERE token_hash = ?").run(hashToken(token));
+    if (/^[a-f0-9]{64}$/.test(token)) await dbRun("DELETE FROM sessions WHERE token_hash = ?", [hashToken(token)]);
     json(response, 200, { message: "You’re signed out." }, { "Set-Cookie": cookieHeader("", 0) });
     return;
   }
   if (request.method === "GET" && pathname === "/api/owner") {
-    const admin = requireAdmin(request, response);
+    const admin = await requireAdmin(request, response);
     if (!admin) return;
     await ownerDashboard(admin, response);
     return;
   }
-  const user = requireUser(request, response);
+  const user = await requireUser(request, response);
   if (!user) return;
   if (request.method === "GET" && pathname === "/api/dashboard") {
     const query = new URL(request.url, publicBaseURL).searchParams;
@@ -1140,7 +1046,7 @@ async function handleApi(request, response, pathname) {
       json(response, 400, { error: "Invalid task list selection." });
       return;
     }
-    json(response, 200, studentData(user, taskFilter, taskOffset));
+    json(response, 200, await studentData(user, taskFilter, taskOffset));
     return;
   }
   if (request.method === "GET" && pathname === "/api/billing/prices") {
@@ -1158,15 +1064,20 @@ async function handleApi(request, response, pathname) {
       json(response, 400, { error: "Please check the task details.", fieldErrors: errors });
       return;
     }
-    const activeCount = database.prepare("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL").get(user.id).count;
-    if (user.plan !== "plus" && activeCount >= freeTaskLimit) {
+    const task = await withTransaction(async (client) => {
+      const lock = usesPostgres ? " FOR UPDATE" : "";
+      const currentUser = await dbGet(`SELECT plan FROM users WHERE id = ?${lock}`, [user.id], client);
+      const activeCount = Number((await dbGet("SELECT COUNT(*) AS count FROM tasks WHERE user_id = ? AND completed_at IS NULL", [user.id], client)).count);
+      if (currentUser?.plan !== "plus" && activeCount >= freeTaskLimit) return null;
+      return dbGet("INSERT INTO tasks (user_id, title, due_date, priority, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *", [
+        user.id, input.title.trim().normalize("NFC"), input.dueDate || null, input.priority || "normal", Date.now(),
+      ], client);
+    });
+    if (!task) {
       json(response, 403, { code: "FREE_TASK_LIMIT", error: `Your free plan includes up to ${freeTaskLimit} active tasks. Upgrade to Plus for unlimited tasks.` });
       return;
     }
-    const result = database.prepare("INSERT INTO tasks (user_id, title, due_date, priority, created_at) VALUES (?, ?, ?, ?, ?)").run(
-      user.id, input.title.trim().normalize("NFC"), input.dueDate || null, input.priority || "normal", Date.now(),
-    );
-    json(response, 201, { task: apiTask(database.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").get(Number(result.lastInsertRowid), user.id)) });
+    json(response, 201, { task: apiTask(task) });
     return;
   }
   const taskRoute = pathname.match(/^\/api\/tasks\/(\d+)$/);
@@ -1177,7 +1088,7 @@ async function handleApi(request, response, pathname) {
       return;
     }
     const input = await readJson(request);
-    const existing = database.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").get(id, user.id);
+    const existing = await dbGet("SELECT * FROM tasks WHERE id = ? AND user_id = ?", [id, user.id]);
     if (!existing) {
       json(response, 404, { error: "Task not found." });
       return;
@@ -1187,18 +1098,18 @@ async function handleApi(request, response, pathname) {
         json(response, 400, { error: "Completion must be true or false." });
         return;
       }
-      database.prepare("UPDATE tasks SET completed_at = ? WHERE id = ? AND user_id = ?").run(input.completed ? Date.now() : null, id, user.id);
+      await dbRun("UPDATE tasks SET completed_at = ? WHERE id = ? AND user_id = ?", [input.completed ? Date.now() : null, id, user.id]);
     } else {
       const errors = validateTask(input);
       if (Object.keys(errors).length) {
         json(response, 400, { error: "Please check the task details.", fieldErrors: errors });
         return;
       }
-      database.prepare("UPDATE tasks SET title = ?, due_date = ?, priority = ? WHERE id = ? AND user_id = ?").run(
+      await dbRun("UPDATE tasks SET title = ?, due_date = ?, priority = ? WHERE id = ? AND user_id = ?", [
         input.title.trim().normalize("NFC"), input.dueDate || null, input.priority || "normal", id, user.id,
-      );
+      ]);
     }
-    json(response, 200, { task: apiTask(database.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").get(id, user.id)) });
+    json(response, 200, { task: apiTask(await dbGet("SELECT * FROM tasks WHERE id = ? AND user_id = ?", [id, user.id])) });
     return;
   }
   if (request.method === "DELETE" && taskRoute) {
@@ -1207,7 +1118,7 @@ async function handleApi(request, response, pathname) {
       json(response, 400, { error: "Invalid task ID." });
       return;
     }
-    const result = database.prepare("DELETE FROM tasks WHERE id = ? AND user_id = ?").run(id, user.id);
+    const result = await dbRun("DELETE FROM tasks WHERE id = ? AND user_id = ?", [id, user.id]);
     if (!result.changes) {
       json(response, 404, { error: "Task not found." });
       return;
@@ -1222,19 +1133,25 @@ async function handleApi(request, response, pathname) {
       json(response, 400, { error: "Please check the activity details.", fieldErrors: errors });
       return;
     }
-    const activityCount = database.prepare(`
-      SELECT COUNT(*) AS count FROM activities
-      WHERE user_id = ? AND kind IN ('club', 'sport', 'other')
-      AND starts_at >= ? AND starts_at < ?
-    `).get(user.id, new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime(), new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).getTime()).count;
-    if (user.plan !== "plus" && ["club", "sport", "other"].includes(input.kind) && activityCount >= freeActivityLimit) {
+    const activity = await withTransaction(async (client) => {
+      const lock = usesPostgres ? " FOR UPDATE" : "";
+      const currentUser = await dbGet(`SELECT plan FROM users WHERE id = ?${lock}`, [user.id], client);
+      const isLimitedActivity = ["club", "sport", "other"].includes(input.kind);
+      const activityCount = isLimitedActivity ? Number((await dbGet(`
+        SELECT COUNT(*) AS count FROM activities
+        WHERE user_id = ? AND kind IN ('club', 'sport', 'other')
+        AND starts_at >= ? AND starts_at < ?
+      `, [user.id, new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime(), new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1).getTime()], client)).count) : 0;
+      if (currentUser?.plan !== "plus" && isLimitedActivity && activityCount >= freeActivityLimit) return null;
+      return dbGet("INSERT INTO activities (user_id, title, kind, starts_at, ends_at, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *", [
+        user.id, input.title.trim().normalize("NFC"), input.kind, input.startsAt, input.endsAt, Date.now(),
+      ], client);
+    });
+    if (!activity) {
       json(response, 403, { code: "FREE_ACTIVITY_LIMIT", error: `Your free plan includes ${freeActivityLimit} extracurricular activities each month. Upgrade to Plus for more.` });
       return;
     }
-    const result = database.prepare("INSERT INTO activities (user_id, title, kind, starts_at, ends_at, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
-      user.id, input.title.trim().normalize("NFC"), input.kind, input.startsAt, input.endsAt, Date.now(),
-    );
-    json(response, 201, { activity: apiActivity(database.prepare("SELECT * FROM activities WHERE id = ? AND user_id = ?").get(Number(result.lastInsertRowid), user.id)) });
+    json(response, 201, { activity: apiActivity(activity) });
     return;
   }
   const activityRoute = pathname.match(/^\/api\/activities\/(\d+)$/);
@@ -1244,7 +1161,7 @@ async function handleApi(request, response, pathname) {
       json(response, 400, { error: "Invalid activity ID." });
       return;
     }
-    const result = database.prepare("DELETE FROM activities WHERE id = ? AND user_id = ?").run(id, user.id);
+    const result = await dbRun("DELETE FROM activities WHERE id = ? AND user_id = ?", [id, user.id]);
     if (!result.changes) {
       json(response, 404, { error: "Activity not found." });
       return;
@@ -1315,7 +1232,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     if (pathname === "/owner" || pathname === "/admin") {
-      const user = getUserFromSession(request);
+      const user = await getUserFromSession(request);
       if (!user) {
         response.writeHead(302, { ...securityHeaders(), Location: "/login?next=%2Fowner", "Cache-Control": "no-store" });
         response.end();
@@ -1346,5 +1263,14 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, () => {
-  console.log(`Northstar is running at http://localhost:${port}`);
+  console.log(`Northstar is listening on port ${port}`);
 });
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    server.close(async () => {
+      await closeDatabase();
+      process.exit(0);
+    });
+  });
+}

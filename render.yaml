@@ -3,19 +3,13 @@ services:
     name: northstar-student-planner
     runtime: node
     region: singapore
-    plan: starter
-    buildCommand: npm install --omit=dev
+    plan: free
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /healthz
-    disk:
-      name: northstar-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATA_DIRECTORY
-        value: /var/data
       - key: BUSINESS_COUNTRY
         value: LK
       - key: PADDLE_ENV
@@ -23,4 +17,6 @@ services:
       - key: PADDLE_MERCHANT_APPROVED
         value: "false"
       - key: ADMIN_EMAILS
+        sync: false
+      - key: DATABASE_URL
         sync: false

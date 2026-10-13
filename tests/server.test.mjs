@@ -208,6 +208,12 @@ test("enforces free task and extracurricular limits on the server", async () => 
   const blockedTask = await createTask("One task too many");
   assert.equal(blockedTask.status, 403);
   assert.equal((await blockedTask.json()).code, "FREE_TASK_LIMIT");
+  const concurrentTaskAttempts = await Promise.all([
+    createTask("Concurrent task one"),
+    createTask("Concurrent task two"),
+    createTask("Concurrent task three"),
+  ]);
+  assert.deepEqual(concurrentTaskAttempts.map((response) => response.status), [403, 403, 403]);
 
   const start = Date.now() + 60_000;
   for (let index = 0; index < 5; index += 1) {
@@ -232,6 +238,13 @@ test("enforces free task and extracurricular limits on the server", async () => 
   });
   assert.equal(blockedActivity.status, 403);
   assert.equal((await blockedActivity.json()).code, "FREE_ACTIVITY_LIMIT");
+  const concurrentActivityAttempts = await Promise.all([0, 1, 2].map((index) => request("/api/activities", {
+    method: "POST",
+    cookie: studentCookie,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: `Concurrent club ${index}`, kind: "club", startsAt: start, endsAt: start + 60_000 }),
+  })));
+  assert.deepEqual(concurrentActivityAttempts.map((response) => response.status), [403, 403, 403]);
 });
 
 test("only a correctly signed Stripe webhook grants Plus; event delivery is idempotent", async () => {

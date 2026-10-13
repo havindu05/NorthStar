@@ -1,32 +1,32 @@
 # Northstar
 
-A student planning MVP with a public product page, account signup/sign-in, a private task and weekly activity dashboard, free-tier limits, a private owner dashboard, and installable PWA support. It uses Node.js built-ins and SQLite; no npm dependencies are required.
+A student planning MVP with a public product page, account signup/sign-in, a private task and weekly activity dashboard, free-tier limits, a private owner dashboard, and installable PWA support. It uses SQLite for local development/tests and PostgreSQL when `DATABASE_URL` is configured.
 
 ## Local setup
 
-- Node.js 22.13 or newer (`node:sqlite` is built in).
+- Node.js 22.13 or newer.
 
 ```sh
 cp .env.example .env
 npm start
 ```
 
-Open http://localhost:3000. The marketing page is `/`, sign-in is `/login`, the student dashboard is `/dashboard`, and the owner dashboard is `/owner`. SQLite initializes `data/auth.sqlite` automatically. The `.env` and `data/` paths are ignored by Git. Run integration tests with `npm test`.
+Open http://localhost:3000. The marketing page is `/`, sign-in is `/login`, the student dashboard is `/dashboard`, and the owner dashboard is `/owner`. Without `DATABASE_URL`, the app initializes `data/auth.sqlite` automatically. Set `DATABASE_URL` to use PostgreSQL. The `.env` and `data/` paths are ignored by Git. Run integration tests with `npm test`.
 
 Set `ADMIN_EMAILS` in `.env` to the comma-separated email address(es) that should receive the owner dashboard. The email must match an existing signup (case-insensitive). Leave it empty to disable owner analytics.
 
 ## Deploy to Render
 
-The included `render.yaml` is a Render Blueprint for one Node.js web service with a persistent disk mounted at `/var/data`. The disk is required because Northstar stores accounts and planning data in SQLite. The service is configured for the Singapore region and a paid Starter instance; do not change it to an ephemeral filesystem or scale it to multiple instances. Render persistent disks are for single-instance workloads.
+The included `render.yaml` is a Render Blueprint for a free Node.js web service backed by Neon PostgreSQL. Render free services have an ephemeral filesystem and may sleep, so Northstar must use the external database; never deploy with `DATABASE_URL` empty.
 
 1. Create a private GitHub repository and upload/push this project. Do not include `.env`, `data/`, or real credentials. The working copy's local `.env` and SQLite database are private local data and must not be uploaded.
 2. In Render, create a Blueprint from that GitHub repository and review `render.yaml`. Choose a unique service name if the suggested one is unavailable.
-3. During Blueprint setup, provide `ADMIN_EMAILS` with the exact email used for your owner account. Add other production secrets only in Render's Environment settings; never commit them.
+3. During Blueprint setup, provide `ADMIN_EMAILS` with the exact email used for your owner account and `DATABASE_URL` with the rotated Neon URL, entered directly into Render's private Environment settings. Never commit or paste database credentials into chat.
 4. Deploy, then open the `onrender.com` URL Render assigns. The app uses Render's `RENDER_EXTERNAL_URL` automatically for secure origin checks and production URLs. Render provisions HTTPS.
-5. Confirm the homepage, sign-in, signup, `/healthz`, and owner dashboard work. Create a new production account: the local SQLite database is not copied to the cloud. Keep a safe backup of the local database before any deliberate migration.
+5. Confirm the homepage, sign-in, signup, `/healthz`, and owner dashboard work. Cloud PostgreSQL starts with empty tables; the local SQLite database and accounts are not copied automatically.
 6. Configure a custom domain only if you have one; set `PUBLIC_BASE_URL` to its final HTTPS origin and redeploy. Use the final HTTPS URL in your Paddle application. Leave Paddle live billing disabled until Paddle approves both the seller and payout route.
 
-The Render Starter service and persistent disk have ongoing charges. Confirm the current price in Render before deploying. A persistent disk does not replace off-site backups. The SQLite setup is intended for a single service instance; use managed PostgreSQL and shared rate limiting before scaling out.
+Render's free service can sleep and has limited resources; it is for demos and testing, not production reliability. Neon also has free-tier limits that may change. Review both providers' current quotas and billing alerts before deploying.
 
 ## Working features
 
@@ -84,8 +84,9 @@ For store apps, package the PWA with a wrapper such as Capacitor, then complete 
 ## Configuration and production
 
 - `PORT`: HTTP port (default `3000`).
-- `DATABASE_PATH`: optional SQLite path (default `data/auth.sqlite`).
-- `DATA_DIRECTORY`: directory for the SQLite database (set to `/var/data` on Render).
+- `DATABASE_URL`: optional PostgreSQL connection URL with TLS enabled (`sslmode=require`); when set, PostgreSQL is used instead of SQLite.
+- `DATABASE_PATH`: optional SQLite path used when `DATABASE_URL` is not set (default `data/auth.sqlite`).
+- `DATA_DIRECTORY`: directory for SQLite when PostgreSQL is not configured.
 - `ADMIN_EMAILS`: comma-separated owner email allow-list.
 - `BUSINESS_COUNTRY`: actual business registration country; defaults to `LK` and blocks direct Stripe billing.
 - `PADDLE_ENV`, `PADDLE_API_KEY`, `PADDLE_WEBHOOK_SECRET`, `PADDLE_PRICE_MONTHLY`, `PADDLE_PRICE_YEARLY`, `PADDLE_MERCHANT_APPROVED`: Paddle integration settings.
