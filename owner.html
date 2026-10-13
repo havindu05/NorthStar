@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f8f4" />
+    <meta name="description" content="Private Northstar owner dashboard." />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <title>Owner dashboard — Northstar</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/owner.css" />
+    <script src="/owner.js" defer></script>
+  </head>
+  <body>
+    <main class="owner-shell">
+      <header class="owner-header">
+        <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">✳</span><span>northstar</span><span class="owner-badge">OWNER</span></a>
+        <div class="header-right"><a href="/dashboard">Student view ↗</a><button type="button" id="owner-signout">Sign out</button></div>
+      </header>
+
+      <section class="owner-content">
+        <div class="owner-heading">
+          <div><span class="eyebrow">YOUR LITTLE CORNER OF NORTHSTAR</span><h1>Good morning, <span id="owner-name">Founder</span>.</h1><p>A calm view of your growing student community.</p></div>
+          <button class="refresh-button" type="button" id="refresh-owner">↻ <span>Refresh overview</span></button>
+        </div>
+
+        <div class="owner-notice" id="owner-notice" role="status" aria-live="polite" hidden></div>
+
+        <section class="owner-stats" aria-label="Project overview">
+          <article class="owner-stat"><span class="stat-icon people-icon">♙</span><span class="stat-label">ALL STUDENTS</span><b id="total-users">—</b><small><span id="new-users">—</span> joined this month</small></article>
+          <article class="owner-stat"><span class="stat-icon free-icon">✳</span><span class="stat-label">ON FREE</span><b id="free-users">—</b><small>students planning for free</small></article>
+          <article class="owner-stat"><span class="stat-icon paid-icon">✦</span><span class="stat-label">PLUS STUDENTS</span><b id="plus-users">—</b><small>paid plan access right now</small></article>
+          <article class="owner-stat revenue-stat"><span class="stat-icon revenue-icon">↗</span><span class="stat-label">ACTIVE SUBSCRIPTION VALUE</span><b id="recurring-value">Not connected</b><small id="revenue-caption">Stripe recurring revenue estimate</small></article>
+        </section>
+
+        <section class="owner-panels">
+          <article class="owner-card community-card">
+            <div class="card-heading"><div><span class="eyebrow">A QUICK HELLO</span><h2>Recently joined</h2></div><span class="card-ornament">✳</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>STUDENT</th><th>PLAN</th><th>JOINED</th></tr></thead>
+                <tbody id="recent-students"><tr><td colspan="3" class="loading-cell">Loading your community…</td></tr></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="owner-card pulse-card">
+            <div class="card-heading"><div><span class="eyebrow">LITTLE SIGNS OF MOMENTUM</span><h2>What’s happening</h2></div></div>
+            <div class="pulse-list">
+              <div class="pulse-row"><span class="pulse-icon tasks-pulse">☷</span><span>Tasks planned</span><b id="total-tasks">—</b></div>
+              <div class="pulse-row"><span class="pulse-icon activity-pulse">✳</span><span>Activities added</span><b id="total-activities">—</b></div>
+              <div class="pulse-row"><span class="pulse-icon session-pulse">◉</span><span>Signed-in sessions</span><b id="live-sessions">—</b></div>
+            </div>
+            <p class="pulse-note">Small steps count. Thanks for building a tool that helps students make room for life, too.</p>
+          </article>
+        </section>
+
+        <section class="owner-card pricing-card">
+          <div class="pricing-art" aria-hidden="true"><span>✦</span><i></i><i></i><i></i></div>
+          <div class="pricing-copy"><span class="eyebrow">A GENTLE FIRST PRICING TEST</span><h2>Keep a generous free plan. Try Plus at <span>$3.99 monthly</span> or <span>$29.99 yearly.</span></h2><p>That’s about $2.50 per month when billed yearly. Treat this as a test price, not a forever decision: talk to students, measure conversion and cancellations, and adjust before a large launch. Always match live checkout prices to the provider’s configured prices.</p></div>
+        </section>
+
+        <section class="owner-callout">
+          <span class="callout-icon">✳</span><div><b>Keep the business side safe and sustainable.</b><p>Card numbers stay with your payment provider. Check payouts and actual net earnings in the provider’s account dashboard—this screen shows an estimated recurring subscription value, not money already paid out.</p></div>
+        </section>
+
+        <footer class="owner-footer"><a href="/">← Northstar home</a><span id="updated-at">Secure owner view</span></footer>
+      </section>
+    </main>
+  </body>
+</html>
